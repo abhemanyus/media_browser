@@ -14,7 +14,13 @@
     </form>
     <h2 id="sse">Hi! 0x</h2>
     <script>
-
+      const evtSource = new EventSource("sse");
+      const output = document.getElementById("sse");
+      let count = 0;
+      evtSource.onmessage = (event) => {
+        count += 1;
+        output.textContent = `${event.data} ${count}x`
+      }
     </script>
 </body>
 

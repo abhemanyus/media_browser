@@ -3,7 +3,7 @@ use std::{
     env,
     net::SocketAddr,
     path::{Path, PathBuf},
-    time::Duration,
+    sync::Arc,
 };
 
 use askama::Template;
@@ -15,19 +15,18 @@ use axum::{
         sse::{Event, KeepAlive},
         IntoResponse, Sse,
     },
-    routing::get,
+    routing::{get, post},
     Extension, Router, Server,
 };
 
-use futures_util::{stream, Stream};
+use futures_util::Stream;
 use log::{debug, error, info};
 
 use thiserror::Error;
 
 use sqlx::SqlitePool;
+use tokio::sync::watch::{self, Receiver, Sender};
 use tower_http::services::ServeDir;
-
-use tokio_stream::StreamExt;
 
 #[derive(Template)]
 #[template(path = "hello.html")]
@@ -164,11 +163,26 @@ async fn upload(
     Ok(upload_data)
 }
 
-async fn sse_handler() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = stream::repeat_with(|| Event::default().data("hi!"))
-        .map(Ok)
-        .throttle(Duration::from_secs(1));
+async fn sse_handler(
+    Extension(mut listeners): Extension<Receiver<String>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = async_stream::stream! {
+        while listeners.changed().await.is_ok() {
+            let msg = listeners.borrow().clone();
+            yield Ok(Event::default().data(msg))
+        }
+    };
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+async fn send_notification(
+    Extension(notifier): Extension<Arc<Sender<String>>>,
+    message: String,
+) -> &'static str {
+    match notifier.send(message) {
+        Ok(_) => "Hallejulah!",
+        Err(_) => "Woopsie!",
+    }
 }
 
 #[tokio::main]
@@ -183,9 +197,14 @@ async fn main() {
         .run(&pool)
         .await
         .expect("run sql migrations");
+    let (notifier, listeners) = watch::channel(String::from("Hi!"));
     let app = Router::new()
         .route("/", get(hello).post(upload))
-        .route("/sse", get(sse_handler))
+        .route("/sse", get(sse_handler).layer(Extension(listeners)))
+        .route(
+            "/notify",
+            post(send_notification).layer(Extension(Arc::new(notifier))),
+        )
         .layer(Extension(pool))
         .fallback_service(ServeDir::new("/tmp"));
     let addr = SocketAddr::from(([127, 0, 0, 1], 8001));
