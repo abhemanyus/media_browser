@@ -14,7 +14,7 @@
     </form>
     <h2 id="sse">Hi! 0x</h2>
     <script>
-      const evtSource = new EventSource("sse");
+      const evtSource = new EventSource("sse/ooga");
       const output = document.getElementById("sse");
       let count = 0;
       evtSource.onmessage = (event) => {

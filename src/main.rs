@@ -1,7 +1,9 @@
 use std::{
+    collections::HashMap,
     convert::Infallible,
     env,
     net::SocketAddr,
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -10,22 +12,26 @@ use askama::Template;
 
 use axum::{
     body::Bytes,
-    extract::{multipart::MultipartError, Multipart},
+    extract::{self, multipart::MultipartError, Multipart},
     response::{
         sse::{Event, KeepAlive},
         IntoResponse, Sse,
     },
     routing::{get, post},
-    Extension, Router, Server,
+    Extension, Json, Router, Server,
 };
 
 use futures_util::Stream;
 use log::{debug, error, info};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use sqlx::SqlitePool;
-use tokio::sync::watch::{self, Receiver, Sender};
+use tokio::sync::{
+    watch::{self, Receiver, Sender},
+    RwLock,
+};
 use tower_http::services::ServeDir;
 
 #[derive(Template)]
@@ -164,26 +170,74 @@ async fn upload(
 }
 
 async fn sse_handler(
-    Extension(mut listeners): Extension<Receiver<String>>,
+    Extension(notifier): Extension<NotifierExt>,
+    extract::Path(namespace): extract::Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let watcher_map = notifier.read().await;
+    let mut listeners = match watcher_map.get(&namespace) {
+        Some(watcher) => watcher.1.clone(),
+        None => {
+            drop(watcher_map);
+            let watcher = watch::channel(Notification::default());
+            let listeners = watcher.1.clone();
+            notifier.write().await.insert(namespace, watcher);
+            listeners
+        }
+    };
     let stream = async_stream::stream! {
         while listeners.changed().await.is_ok() {
             let msg = listeners.borrow().clone();
-            yield Ok(Event::default().data(msg))
+            yield Ok(Event::default().json_data(msg).expect("data not called"))
         }
     };
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 async fn send_notification(
-    Extension(notifier): Extension<Arc<Sender<String>>>,
-    message: String,
+    extract::Path(namespace): extract::Path<String>,
+    Extension(notifier): Extension<NotifierExt>,
+    Json(message): Json<Notification>,
 ) -> &'static str {
-    match notifier.send(message) {
-        Ok(_) => "Hallejulah!",
-        Err(_) => "Woopsie!",
+    let hashmap = notifier.read().await;
+    if let Some(watcher) = hashmap.get(&namespace) {
+        match watcher.0.send(message) {
+            Ok(_) => "Hallejulah!",
+            Err(_) => "Woopsie!",
+        }
+    } else {
+        drop(hashmap);
+        let watcher = watch::channel(Notification::default());
+        let response = match watcher.0.send(message) {
+            Ok(_) => "Hallejulah!",
+            Err(_) => "Woopsie!",
+        };
+        notifier.write().await.insert(namespace, watcher);
+        response
     }
 }
+
+#[derive(Default, Deserialize, Serialize, Clone)]
+enum Notification {
+    #[default]
+    Empty,
+    Text(String),
+}
+#[derive(Default)]
+struct Notifier(HashMap<String, (Sender<Notification>, Receiver<Notification>)>);
+impl Deref for Notifier {
+    type Target = HashMap<String, (Sender<Notification>, Receiver<Notification>)>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl DerefMut for Notifier {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+type NotifierExt = Arc<RwLock<Notifier>>;
 
 #[tokio::main]
 async fn main() {
@@ -197,14 +251,11 @@ async fn main() {
         .run(&pool)
         .await
         .expect("run sql migrations");
-    let (notifier, listeners) = watch::channel(String::from("Hi!"));
     let app = Router::new()
         .route("/", get(hello).post(upload))
-        .route("/sse", get(sse_handler).layer(Extension(listeners)))
-        .route(
-            "/notify",
-            post(send_notification).layer(Extension(Arc::new(notifier))),
-        )
+        .route("/sse/:namespace", get(sse_handler))
+        .route("/notify/:namespace", post(send_notification))
+        .layer(Extension(Arc::new(RwLock::new(Notifier::default()))))
         .layer(Extension(pool))
         .fallback_service(ServeDir::new("/tmp"));
     let addr = SocketAddr::from(([127, 0, 0, 1], 8001));
